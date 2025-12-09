@@ -1,25 +1,37 @@
 #!/usr/bin/env bash
-# kartik.sh - Minimal, robust Google Cloud Deploy bootstrap script (portable)
+# kartik.sh - Minimal, robust Google Cloud Deploy bootstrap script (final)
+# - Portable sed detection (GNU / BSD / BusyBox)
+# - Preflight checks, safe spinner, timeouts, sensible failures
 set -euo pipefail
 
-### Configuration (adjust if needed)
+### Config (tweak timeouts if needed)
 CLUSTER_WAIT_TIMEOUT=1800    # seconds per cluster (30m)
 ROLLOUT_WAIT_TIMEOUT=1800    # seconds for rollout to succeed (30m)
 POLL_INTERVAL=5              # seconds between polls
 
-### Portable inplace sed helper
+### Portable inplace sed helper (handles GNU, BSD/macOS, BusyBox)
 inplace_sed() {
   local expr="$1" file="$2"
-  # Use GNU sed if available, else macOS/BSD sed style
-  if sed --version >/dev/null 2>&1; then
+  # Detect GNU sed
+  if sed --version >/dev/null 2>&1 && sed --version 2>&1 | grep -qi 'gnu'; then
     sed -i "$expr" "$file"
-  else
-    sed -i '' "$expr" "$file"
+    return $?
   fi
+  # Detect BSD/macOS sed (has -i with required extension arg)
+  if sed -i '' '1!d' "$file" >/dev/null 2>&1; then
+    sed -i '' "$expr" "$file"
+    return $?
+  fi
+  # BusyBox / fallback: try plain -i, if it fails, error
+  if sed -i "$expr" "$file" >/dev/null 2>&1; then
+    return $?
+  fi
+  printf "inplace_sed: unable to run sed safely on this system\n" >&2
+  return 1
 }
 
 ### Preflight: required commands
-REQUIRED_CMDS=(gcloud kubectl gsutil git skaffold envsubst sed awk sleep date)
+REQUIRED_CMDS=(gcloud kubectl gsutil git skaffold envsubst sed awk sleep date bash)
 for cmd in "${REQUIRED_CMDS[@]}"; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     printf "Required command '%s' not found. Install it and retry.\n" "$cmd" >&2
@@ -45,7 +57,7 @@ spinner() {
   printf "\b \n"
 }
 
-# Run a command in background and spinner it, returning the exit code
+# Run command in background and spinner it (returns command exit code)
 run_bg() {
   local cmd="$1"
   bash -c "$cmd" &
@@ -55,7 +67,7 @@ run_bg() {
   return $?
 }
 
-### Detect project / zone / region
+### Detect Project / Zone / Region
 PROJECT_ID=$(gcloud config get-value project 2>/dev/null || true)
 if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "(unset)" ]; then
   read -rp "Enter GCP Project ID: " PROJECT_ID
@@ -66,7 +78,6 @@ if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "(unset)" ]; then
 fi
 export PROJECT_ID
 
-# Zone detection
 ZONE=$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items[google-compute-default-zone])" 2>/dev/null || true)
 if [ -z "$ZONE" ]; then
   read -rp "Enter Zone (e.g., us-central1-a): " ZONE
@@ -76,7 +87,6 @@ if [ -z "$ZONE" ]; then
   fi
 fi
 
-# Region detection (derive from zone if possible)
 REGION=$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items[google-compute-default-region])" 2>/dev/null || true)
 if [ -z "$REGION" ]; then
   REGION="${ZONE%-*}"
@@ -91,7 +101,6 @@ fi
 
 export ZONE REGION
 
-# Project number
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null || true)
 if [ -z "$PROJECT_NUMBER" ]; then
   echo "Unable to fetch project number for $PROJECT_ID. Ensure you have access and the project exists." >&2
@@ -110,13 +119,13 @@ gcloud config set compute/zone "$ZONE" >/dev/null || true
 ### Enable required APIs
 echo "Enabling required APIs..."
 run_bg "gcloud services enable container.googleapis.com clouddeploy.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com" || {
-  echo "Failed to enable required APIs." >&2
+  echo "Failed to enable required APIs. Check permissions / billing." >&2
   exit 1
 }
 
-### Grant roles to default Compute Engine SA
+### Grant minimal roles to Compute Engine default SA
 SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-echo "Binding roles to service account $SA (requires Owner or equivalent)..."
+echo "Granting roles to service account: $SA (requires Owner/equivalent)..."
 run_bg "gcloud projects add-iam-policy-binding \"$PROJECT_ID\" --member=\"serviceAccount:${SA}\" --role=\"roles/clouddeploy.jobRunner\" --quiet" || {
   echo "Failed to bind clouddeploy.jobRunner role. Check permissions." >&2
   exit 1
@@ -126,7 +135,7 @@ run_bg "gcloud projects add-iam-policy-binding \"$PROJECT_ID\" --member=\"servic
   exit 1
 }
 
-### Create Artifact Registry (if missing)
+### Artifact Registry
 if ! gcloud artifacts repositories describe cicd-challenge --location="$REGION" >/dev/null 2>&1; then
   echo "Creating Artifact Registry 'cicd-challenge' in $REGION..."
   run_bg "gcloud artifacts repositories create cicd-challenge --repository-format=docker --location=\"$REGION\" --description='Image registry for CI/CD' --quiet" || {
@@ -137,7 +146,7 @@ else
   echo "Artifact Registry 'cicd-challenge' exists."
 fi
 
-### Create GKE clusters and wait until RUNNING
+### Create GKE clusters (and wait)
 create_cluster_and_wait() {
   local name="$1" timeout="$2" start now elapsed
   start=$(date +%s)
@@ -170,7 +179,7 @@ create_cluster_and_wait() {
 create_cluster_and_wait "cd-staging" "$CLUSTER_WAIT_TIMEOUT" || { echo "cd-staging failed"; exit 1; }
 create_cluster_and_wait "cd-production" "$CLUSTER_WAIT_TIMEOUT" || { echo "cd-production failed"; exit 1; }
 
-### Prepare repository and skaffold
+### Clone tutorials & prepare skaffold
 WORKDIR="$HOME/cloud-deploy-tutorials"
 if [ ! -d "$WORKDIR" ]; then
   echo "Cloning Google Cloud Deploy tutorials..."
@@ -181,7 +190,7 @@ cd "$WORKDIR/tutorials/base" || { echo "Expected tutorials/base not found"; exit
 if [ -f clouddeploy-config/skaffold.yaml.template ]; then
   echo "Generating web/skaffold.yaml..."
   envsubst < clouddeploy-config/skaffold.yaml.template > web/skaffold.yaml
-  inplace_sed "s/{{project-id}}/${PROJECT_ID}/g" web/skaffold.yaml
+  inplace_sed "s/{{project-id}}/${PROJECT_ID}/g" web/skaffold.yaml || true
 fi
 
 ### Ensure Cloud Build bucket
@@ -199,7 +208,7 @@ echo "Running skaffold build..."
 run_bg "skaffold build --interactive=false --default-repo \"$REGION-docker.pkg.dev/$PROJECT_ID/cicd-challenge\" --file-output artifacts.json" || { echo "Skaffold build failed"; exit 1; }
 cd ..
 
-### Delivery pipeline
+### Prepare & apply delivery pipeline
 if [ -f clouddeploy-config/delivery-pipeline.yaml.template ]; then
   cp clouddeploy-config/delivery-pipeline.yaml.template clouddeploy-config/delivery-pipeline.yaml
   inplace_sed "s/targetId: staging/targetId: cd-staging/" clouddeploy-config/delivery-pipeline.yaml || true
@@ -214,13 +223,13 @@ gcloud config set deploy/region "$REGION" >/dev/null || true
 echo "Applying delivery pipeline..."
 run_bg "gcloud beta deploy apply --file=clouddeploy-config/delivery-pipeline.yaml" || { echo "Apply failed"; exit 1; }
 
-### Kubectl contexts & namespace
+### Configure kubectl contexts & namespaces
 for ctx in cd-staging cd-production; do
   echo "Getting credentials for $ctx..."
   run_bg "gcloud container clusters get-credentials \"$ctx\" --zone \"$ZONE\"" || { echo "Get credentials failed for $ctx"; exit 1; }
   kubectl config rename-context "gke_${PROJECT_ID}_${ZONE}_${ctx}" "$ctx" >/dev/null 2>&1 || true
   if [ -f kubernetes-config/web-app-namespace.yaml ]; then
-    kubectl --context "$ctx" apply -f kubernetes-config/web-app-namespace.yaml || { echo "Failed to apply namespace on $ctx"; exit 1; }
+    kubectl --context "$ctx" apply -f kubernetes-config/web-app-namespace.yaml || { echo "Failed to apply namespace to $ctx"; exit 1; }
   fi
 done
 
